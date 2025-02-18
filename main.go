@@ -11,6 +11,7 @@ import (
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/gagliardetto/solana-go/rpc/ws"
+	"golang.org/x/time/rate"
 )
 
 var logger = log.New(os.Stdout, "[TOKEN-MONITOR] ", log.Ldate|log.Ltime)
@@ -30,6 +31,54 @@ type TokenMonitor struct {
 	rpcClient   *rpc.Client
 	isRunning   bool
 	tokenCache  map[solana.PublicKey]TokenInfo // Cache token info
+	rateLimiter *rate.Limiter                  // Add a rate limiter
+}
+
+func NewTokenMonitor(wsEndpoint, rpcEndpoint string) (*TokenMonitor, error) {
+	// Create a rate limiter that allows 10 requests per second with a burst of 20
+	limiter := rate.NewLimiter(rate.Limit(10), 20)
+
+	return &TokenMonitor{
+		wsEndpoint:  wsEndpoint,
+		rpcEndpoint: rpcEndpoint,
+		isRunning:   false,
+		tokenCache:  make(map[solana.PublicKey]TokenInfo), // Initialize the cache
+		rateLimiter: limiter,                              // Initialize the rate limiter
+	}, nil
+}
+
+func (tm *TokenMonitor) getTokenInfo(ctx context.Context, mint solana.PublicKey) (TokenInfo, error) {
+	// Check if token info is in the cache
+	if info, ok := tm.tokenCache[mint]; ok {
+		return info, nil
+	}
+	// Apply rate limiting
+	err := tm.rateLimiter.Wait(ctx) // Wait until a token is available
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("rate limiter error: %w", err)
+	}
+
+	// Fetch token info from the RPC client
+	tokenAccountInfo, err := tm.rpcClient.GetAccountInfo(ctx, mint)
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("failed to get token account info: %w", err)
+	}
+
+	// Decode the token metadata
+	metadata, err := decodeMetadata(tokenAccountInfo.Value.Data.GetBinary())
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("failed to decode metadata: %w", err)
+	}
+
+	tokenInfo := TokenInfo{
+		Name:   metadata.Name,
+		Symbol: metadata.Symbol,
+	}
+
+	// Store token info in the cache
+	tm.tokenCache[mint] = tokenInfo
+
+	return tokenInfo, nil
 }
 
 type TokenInfo struct {
@@ -37,14 +86,7 @@ type TokenInfo struct {
 	Symbol string
 }
 
-func NewTokenMonitor(wsEndpoint, rpcEndpoint string) (*TokenMonitor, error) {
-	return &TokenMonitor{
-		wsEndpoint:  wsEndpoint,
-		rpcEndpoint: rpcEndpoint,
-		isRunning:   false,
-		tokenCache:  make(map[solana.PublicKey]TokenInfo), // Initialize the cache
-	}, nil
-}
+// Removed duplicate NewTokenMonitor function
 
 func (tm *TokenMonitor) connect(ctx context.Context) error {
 	logger.Printf("Connecting to Solana network (WS: %s)...", tm.wsEndpoint)
@@ -202,34 +244,7 @@ func (tm *TokenMonitor) processTokenData(ctx context.Context, data *ws.ProgramRe
 	logger.Printf("==========================\n")
 }
 
-func (tm *TokenMonitor) getTokenInfo(ctx context.Context, mint solana.PublicKey) (TokenInfo, error) {
-	// Check if token info is in the cache
-	if info, ok := tm.tokenCache[mint]; ok {
-		return info, nil
-	}
-
-	// Fetch token info from the RPC client
-	tokenAccountInfo, err := tm.rpcClient.GetAccountInfo(ctx, mint)
-	if err != nil {
-		return TokenInfo{}, fmt.Errorf("failed to get token account info: %w", err)
-	}
-
-	// Decode the token metadata
-	metadata, err := decodeMetadata(tokenAccountInfo.Value.Data.GetBinary())
-	if err != nil {
-		return TokenInfo{}, fmt.Errorf("failed to decode metadata: %w", err)
-	}
-
-	tokenInfo := TokenInfo{
-		Name:   metadata.Name,
-		Symbol: metadata.Symbol,
-	}
-
-	// Store token info in the cache
-	tm.tokenCache[mint] = tokenInfo
-
-	return tokenInfo, nil
-}
+// Duplicate function removed
 
 // Metadata struct
 type Metadata struct {
