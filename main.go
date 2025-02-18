@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync" // Import the sync package
 	"time"
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
 	"github.com/gagliardetto/solana-go/rpc/ws"
+	"github.com/gorilla/websocket" // Import gorilla/websocket
 	"golang.org/x/time/rate"
 )
 
@@ -22,63 +24,18 @@ const (
 	wsTimeout         = 60 * time.Second
 	rpcTimeout        = 10 * time.Second
 	maxReconnectTries = 5
+	pingInterval      = 15 * time.Second // Send ping every 30 seconds
 )
 
 type TokenMonitor struct {
 	wsEndpoint  string
 	rpcEndpoint string
 	wsClient    *ws.Client
+	wsConn      *websocket.Conn // Store the underlying WebSocket connection
 	rpcClient   *rpc.Client
 	isRunning   bool
-	tokenCache  map[solana.PublicKey]TokenInfo // Cache token info
-	rateLimiter *rate.Limiter                  // Add a rate limiter
-}
-
-func NewTokenMonitor(wsEndpoint, rpcEndpoint string) (*TokenMonitor, error) {
-	// Create a rate limiter that allows 10 requests per second with a burst of 20
-	limiter := rate.NewLimiter(rate.Limit(10), 20)
-
-	return &TokenMonitor{
-		wsEndpoint:  wsEndpoint,
-		rpcEndpoint: rpcEndpoint,
-		isRunning:   false,
-		tokenCache:  make(map[solana.PublicKey]TokenInfo), // Initialize the cache
-		rateLimiter: limiter,                              // Initialize the rate limiter
-	}, nil
-}
-
-func (tm *TokenMonitor) getTokenInfo(ctx context.Context, mint solana.PublicKey) (TokenInfo, error) {
-	// Check if token info is in the cache
-	if info, ok := tm.tokenCache[mint]; ok {
-		return info, nil
-	}
-	// Apply rate limiting
-	err := tm.rateLimiter.Wait(ctx) // Wait until a token is available
-	if err != nil {
-		return TokenInfo{}, fmt.Errorf("rate limiter error: %w", err)
-	}
-
-	// Fetch token info from the RPC client
-	tokenAccountInfo, err := tm.rpcClient.GetAccountInfo(ctx, mint)
-	if err != nil {
-		return TokenInfo{}, fmt.Errorf("failed to get token account info: %w", err)
-	}
-
-	// Decode the token metadata
-	metadata, err := decodeMetadata(tokenAccountInfo.Value.Data.GetBinary())
-	if err != nil {
-		return TokenInfo{}, fmt.Errorf("failed to decode metadata: %w", err)
-	}
-
-	tokenInfo := TokenInfo{
-		Name:   metadata.Name,
-		Symbol: metadata.Symbol,
-	}
-
-	// Store token info in the cache
-	tm.tokenCache[mint] = tokenInfo
-
-	return tokenInfo, nil
+	tokenCache  map[solana.PublicKey]TokenInfo
+	rateLimiter *rate.Limiter
 }
 
 type TokenInfo struct {
@@ -86,7 +43,17 @@ type TokenInfo struct {
 	Symbol string
 }
 
-// Removed duplicate NewTokenMonitor function
+func NewTokenMonitor(wsEndpoint, rpcEndpoint string) (*TokenMonitor, error) {
+	limiter := rate.NewLimiter(rate.Limit(10), 20)
+
+	return &TokenMonitor{
+		wsEndpoint:  wsEndpoint,
+		rpcEndpoint: rpcEndpoint,
+		isRunning:   false,
+		tokenCache:  make(map[solana.PublicKey]TokenInfo),
+		rateLimiter: limiter,
+	}, nil
+}
 
 func (tm *TokenMonitor) connect(ctx context.Context) error {
 	logger.Printf("Connecting to Solana network (WS: %s)...", tm.wsEndpoint)
@@ -95,12 +62,23 @@ func (tm *TokenMonitor) connect(ctx context.Context) error {
 	connectCtx, cancel := context.WithTimeout(ctx, wsTimeout)
 	defer cancel()
 
+	// Establish the initial ws.Client connection (for subscriptions)
 	wsClient, err := ws.Connect(connectCtx, tm.wsEndpoint)
 	if err != nil {
 		return fmt.Errorf("websocket connection failed: %v", err)
 	}
-
 	tm.wsClient = wsClient
+
+	// Now, establish a separate gorilla/websocket connection for pings
+	dialer := websocket.DefaultDialer
+	conn, _, err := dialer.DialContext(connectCtx, tm.wsEndpoint, nil)
+	if err != nil {
+		tm.wsClient.Close() // Close the ws.Client connection if gorilla connection fails
+		tm.wsConn = nil     // Ensure tm.wsConn is set to nil
+		return fmt.Errorf("gorilla websocket connection failed: %v", err)
+	}
+	tm.wsConn = conn // Store the gorilla/websocket connection
+
 	tm.rpcClient = rpc.New(tm.rpcEndpoint)
 
 	// Test RPC connection
@@ -110,6 +88,8 @@ func (tm *TokenMonitor) connect(ctx context.Context) error {
 	_, err = tm.rpcClient.GetHealth(rpcCtx)
 	if err != nil {
 		tm.wsClient.Close()
+		tm.wsConn.Close() // Close the gorilla connection too
+		tm.wsConn = nil   // Ensure tm.wsConn is set to nil
 		return fmt.Errorf("RPC connection test failed: %v", err)
 	}
 
@@ -120,6 +100,10 @@ func (tm *TokenMonitor) connect(ctx context.Context) error {
 func (tm *TokenMonitor) reconnect(ctx context.Context) error {
 	if tm.wsClient != nil {
 		tm.wsClient.Close()
+	}
+	if tm.wsConn != nil {
+		tm.wsConn.Close()
+		tm.wsConn = nil // Ensure tm.wsConn is set to nil
 	}
 
 	for i := 0; i < maxReconnectTries; i++ {
@@ -172,22 +156,64 @@ func (tm *TokenMonitor) StartMonitoring(ctx context.Context) error {
 				continue
 			}
 
+			logger.Println("Successfully subscribed to SPL Token Program") // Added logging
+
+			// Heartbeat ticker
+			ticker := time.NewTicker(pingInterval)
+			defer ticker.Stop()
+
+			var unsubscribeOnce sync.Once // Ensure Unsubscribe is only called once
+
 			// Monitor subscription
 			for tm.isRunning {
-				// Create context with timeout for each receive operation
-				receiveCtx, cancel := context.WithTimeout(ctx, wsTimeout)
-				got, err := sub.Recv(receiveCtx)
-				cancel()
+				select {
+				case <-ticker.C:
+					// Check if tm.wsConn is nil
+					if tm.wsConn == nil {
+						logger.Println("tm.wsConn is nil, skipping ping")
+						tm.handleConnectionError(ctx) // Attempt to reconnect
+						break                         // Break out of the inner loop
+					}
 
-				if err != nil {
-					logger.Printf("Error receiving: %v", err)
-					sub.Unsubscribe()
-					tm.handleConnectionError(ctx)
-					break
+					// Send a ping message using gorilla/websocket
+					err := tm.wsConn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(5*time.Second))
+					if err != nil {
+						logger.Printf("Ping failed: %v", err)
+						unsubscribeOnce.Do(func() { // Call Unsubscribe only once
+							sub.Unsubscribe()
+						})
+						tm.handleConnectionError(ctx)
+						break // Break out of the inner loop
+					} else {
+						logger.Println("Sent ping successfully") // Added logging
+					}
+
+				default:
+					logger.Println("Waiting for data from subscription...") // Added logging
+
+					// Create context with timeout for each receive operation
+					receiveCtx, cancel := context.WithTimeout(ctx, wsTimeout)
+					got, err := sub.Recv(receiveCtx)
+					cancel()
+
+					if err != nil {
+						logger.Printf("Error receiving: %v", err)
+						unsubscribeOnce.Do(func() { // Call Unsubscribe only once
+							sub.Unsubscribe()
+						})
+						tm.handleConnectionError(ctx)
+						break
+					}
+
+					// Check if data is nil
+					if got == nil {
+						logger.Println("Warning: received nil data from sub.Recv, skipping processing")
+						continue // Skip processing this data
+					}
+
+					// Process the received data
+					tm.processTokenData(ctx, got) // Pass the context
 				}
-
-				// Process the received data
-				tm.processTokenData(ctx, got) // Pass the context
 			}
 		}
 	}()
@@ -202,6 +228,13 @@ func (tm *TokenMonitor) handleConnectionError(ctx context.Context) {
 
 	logger.Printf("Connection error detected, attempting to reconnect...")
 
+	// Check tm.isRunning before unsubscribing (example - integrate with sync.Once)
+	// if tm.isRunning {
+	// 	unsubscribeOnce.Do(func() { // Call Unsubscribe only once
+	// 		sub.Unsubscribe()
+	// 	})
+	// }
+
 	err := tm.reconnect(ctx)
 	if err != nil {
 		logger.Printf("Failed to recover connection: %v", err)
@@ -210,6 +243,28 @@ func (tm *TokenMonitor) handleConnectionError(ctx context.Context) {
 }
 
 func (tm *TokenMonitor) processTokenData(ctx context.Context, data *ws.ProgramResult) {
+	if tm == nil {
+		logger.Println("PANIC: tm is nil in processTokenData")
+		return
+	}
+
+	if data == nil {
+		logger.Println("PANIC: data is nil in processTokenData")
+		return
+	}
+
+	// Check if data.Value.Account is nil
+	if data.Value.Account == nil {
+		logger.Println("PANIC: data.Value.Account is nil in processTokenData")
+		return
+	}
+
+	// Check if data.Value.Account.Data is nil
+	if data.Value.Account.Data == nil {
+		logger.Println("PANIC: data.Value.Account.Data is nil in processTokenData")
+		return
+	}
+
 	accountData := data.Value.Account.Data.GetBinary()
 	if len(accountData) < 165 {
 		return // Not a token account
@@ -244,7 +299,40 @@ func (tm *TokenMonitor) processTokenData(ctx context.Context, data *ws.ProgramRe
 	logger.Printf("==========================\n")
 }
 
-// Duplicate function removed
+func (tm *TokenMonitor) getTokenInfo(ctx context.Context, mint solana.PublicKey) (TokenInfo, error) {
+	// Check if token info is in the cache
+	if info, ok := tm.tokenCache[mint]; ok {
+		return info, nil
+	}
+
+	// Apply rate limiting
+	err := tm.rateLimiter.Wait(ctx) // Wait until a token is available
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("rate limiter error: %w", err)
+	}
+
+	// Fetch token info from the RPC client
+	tokenAccountInfo, err := tm.rpcClient.GetAccountInfo(ctx, mint)
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("failed to get token account info: %w", err)
+	}
+
+	// Decode the token metadata
+	metadata, err := decodeMetadata(tokenAccountInfo.Value.Data.GetBinary())
+	if err != nil {
+		return TokenInfo{}, fmt.Errorf("failed to decode metadata: %w", err)
+	}
+
+	tokenInfo := TokenInfo{
+		Name:   metadata.Name,
+		Symbol: metadata.Symbol,
+	}
+
+	// Store token info in the cache
+	tm.tokenCache[mint] = tokenInfo
+
+	return tokenInfo, nil
+}
 
 // Metadata struct
 type Metadata struct {
@@ -337,6 +425,9 @@ func (tm *TokenMonitor) Stop() {
 	if tm.wsClient != nil {
 		tm.wsClient.Close()
 	}
+	if tm.wsConn != nil {
+		tm.wsConn.Close()
+	}
 }
 
 func main() {
@@ -345,8 +436,8 @@ func main() {
 	defer cancel()
 
 	monitor, err := NewTokenMonitor(
-		"wss://api.mainnet-beta.solana.com",
-		"https://api.mainnet-beta.solana.com",
+		"wss://api.devnet.solana.com",   // Use Devnet WebSocket endpoint
+		"https://api.devnet.solana.com", // Use Devnet RPC endpoint
 	)
 	if err != nil {
 		logger.Fatalf("Failed to create monitor: %v", err)
